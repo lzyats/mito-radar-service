@@ -18,6 +18,7 @@ PYTHON = ROOT / "mmwave_venv" / "bin" / "python"
 RUNTIME_DIR = ROOT / "runtime"
 JOB_DIR = RUNTIME_DIR / "jobs"
 RADAR_RECORDS_DIR = RUNTIME_DIR / "radar_records"
+RADAR_CAPTURE_DIR = RUNTIME_DIR / "radar_captures"
 RADAR_LATEST_BIN = RUNTIME_DIR / "radar_latest.bin"
 RADAR_LATEST_JSONL = RUNTIME_DIR / "radar_latest.jsonl"
 RADAR_LATEST_JSON = RUNTIME_DIR / "radar_latest.json"
@@ -29,6 +30,7 @@ ALLOWED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
 
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 RADAR_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
+RADAR_CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
 
 # Allow the service to import local modules and compiled C++ extensions when present.
 sys.path.append(str(ROOT))
@@ -327,7 +329,7 @@ DASHBOARD_HTML = """
             <div class="metric"><span>有效点数</span><strong id="validPoints">-</strong></div>
             <div class="metric"><span>是否有目标</span><strong id="hasTarget">-</strong></div>
             <div class="metric"><span>非空帧</span><strong id="frames">-</strong></div>
-            <div class="metric"><span>最近距离</span><strong id="nearest">-</strong></div>
+            <div class="metric"><span>主峰距离</span><strong id="nearest">-</strong></div>
           </div>
 
           <div class="split">
@@ -377,8 +379,8 @@ DASHBOARD_HTML = """
         ? `${summary.non_empty_frames}/${summary.frames}`
         : "-";
       el("frames").textContent = frames;
-      const nearest = summary.nearest_point || summary.raw_nearest_point;
-      el("nearest").textContent = nearest ? `${nearest.range_m} m` : "-";
+      const displayRange = summary.dominant_range_m ?? summary.median_range_m ?? summary.nearest_point?.range_m ?? summary.raw_nearest_point?.range_m;
+      el("nearest").textContent = displayRange !== undefined && displayRange !== null ? `${displayRange} m` : "-";
     }
 
     async function api(path, options = {}) {
@@ -430,15 +432,16 @@ DASHBOARD_HTML = """
     }
 
     async function refreshRecords() {
-      const data = await fetch("/radar/records?limit=8").then((r) => r.json());
-      if (!data.records || !data.records.length) {
+      const data = await fetch("/radar/captures?limit=8").then((r) => r.json());
+      const records = data.captures || [];
+      if (!records.length) {
         el("recordsBox").innerHTML = '<div class="empty">暂无记录</div>';
         return data;
       }
-      const rows = data.records.map((item) =>
-        `<tr><td>${item.label || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.summary?.valid_point_count ?? "-"}</td></tr>`
+      const rows = records.map((item) =>
+        `<tr><td>${item.saved_as || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.summary?.dominant_range_m ?? item.summary?.nearest_point?.range_m ?? "-"}</td></tr>`
       ).join("");
-      el("recordsBox").innerHTML = `<table><thead><tr><th>标签</th><th>时间</th><th>点数</th></tr></thead><tbody>${rows}</tbody></table>`;
+      el("recordsBox").innerHTML = `<table><thead><tr><th>类型</th><th>时间</th><th>主峰距离</th></tr></thead><tbody>${rows}</tbody></table>`;
       return data;
     }
 
@@ -547,6 +550,24 @@ def compact_point(point: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def percentile(values: list[float], ratio: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(max(round((len(ordered) - 1) * ratio), 0), len(ordered) - 1)
+    return ordered[index]
+
+
+def range_histogram(points: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    buckets: dict[float, dict[str, Any]] = {}
+    for point in points:
+        range_m = round(point["range_m"], 4)
+        bucket = buckets.setdefault(range_m, {"range_m": range_m, "count": 0, "max_snr": point["snr"]})
+        bucket["count"] += 1
+        bucket["max_snr"] = max(bucket["max_snr"], point["snr"])
+    return sorted(buckets.values(), key=lambda item: item["range_m"])
+
+
 def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     non_empty_frames = sum(1 for frame in frames if frame.points)
     summary: dict[str, Any] = {
@@ -580,10 +601,16 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     ys = [point["y_m"] for point in points]
     zs = [point["z_m"] for point in points]
     nearest_point = min(points, key=lambda point: point["range_m"])
+    histogram = range_histogram(points)
+    dominant_bucket = max(histogram, key=lambda item: item["count"]) if histogram else None
 
     summary.update(
         {
             "avg_range_m": round(sum(ranges) / len(ranges), 4),
+            "median_range_m": round(percentile(ranges, 0.5), 4),
+            "p90_range_m": round(percentile(ranges, 0.9), 4),
+            "dominant_range_m": dominant_bucket["range_m"] if dominant_bucket else None,
+            "dominant_range_count": dominant_bucket["count"] if dominant_bucket else 0,
             "min_range_m": round(min(ranges), 4),
             "max_range_m": round(max(ranges), 4),
             "avg_snr": round(sum(snrs) / len(snrs), 4),
@@ -601,6 +628,7 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
                 "range_m": round(sum(ranges) / len(ranges), 4),
             },
             "nearest_point": compact_point(nearest_point),
+            "range_histogram": histogram[:40],
         }
     )
     return summary
@@ -697,6 +725,21 @@ def list_record_items() -> list[dict[str, Any]]:
         return items
 
     for meta_path in sorted(RADAR_RECORDS_DIR.glob("*/*.meta.json"), reverse=True):
+        try:
+            meta = read_json(meta_path)
+        except Exception:
+            continue
+        meta["meta_path"] = str(meta_path)
+        items.append(meta)
+    return items
+
+
+def list_capture_items() -> list[dict[str, Any]]:
+    items: list[dict[str, Any]] = []
+    if not RADAR_CAPTURE_DIR.exists():
+        return items
+
+    for meta_path in sorted(RADAR_CAPTURE_DIR.glob("*.meta.json"), reverse=True):
         try:
             meta = read_json(meta_path)
         except Exception:
@@ -904,9 +947,25 @@ def radar_capture(
         meta_path=RADAR_LATEST_JSON,
     )
 
+    capture_id = f"capture_{now_tag()}_{uuid.uuid4().hex[:8]}"
+    history_meta = {
+        **meta,
+        "capture_id": capture_id,
+        "saved_as": "capture_history",
+    }
+    history_paths = save_capture_artifacts(
+        raw=raw,
+        frames=frames,
+        meta=history_meta,
+        bin_path=RADAR_CAPTURE_DIR / f"{capture_id}.bin",
+        jsonl_path=RADAR_CAPTURE_DIR / f"{capture_id}.jsonl",
+        meta_path=RADAR_CAPTURE_DIR / f"{capture_id}.meta.json",
+    )
+
     return {
         **meta,
         **artifact_paths,
+        "history": history_paths,
     }
 
 
@@ -915,6 +974,15 @@ def radar_latest():
     if not RADAR_LATEST_JSON.exists():
         raise HTTPException(status_code=404, detail="No latest radar capture found")
     return read_json(RADAR_LATEST_JSON)
+
+
+@app.get("/radar/captures")
+def radar_captures(limit: int = Query(20, ge=1, le=200)):
+    items = list_capture_items()[:limit]
+    return {
+        "count": len(items),
+        "captures": items,
+    }
 
 
 @app.post("/radar/record")
