@@ -25,6 +25,7 @@ import argparse
 import binascii
 import json
 import math
+import os
 import struct
 import time
 from dataclasses import dataclass, asdict
@@ -45,6 +46,7 @@ STOP_CMD = b"scan stop\r\n"
 
 POINT_RECORD_SIZE = 20
 SIGNED15_BIAS = 0x4000
+RANGE_DIVISOR = float(os.environ.get("RADAR_RANGE_DIVISOR", "400"))
 
 
 @dataclass
@@ -94,12 +96,12 @@ def parse_point(record: bytes, frame_id: int) -> RadarPoint:
     if len(record) != POINT_RECORD_SIZE:
         raise ValueError(f"point record length must be {POINT_RECORD_SIZE}, got {len(record)}")
 
-    word0, range100, word2, word3, reserved = struct.unpack("<IIIII", record)
+    word0, range_raw, word2, word3, reserved = struct.unpack("<IIIII", record)
 
     point_index = word0 & 0x03FF
     snr = (word0 >> 10) & 0x7FFF
 
-    range_m = range100 / 100.0
+    range_m = range_raw / RANGE_DIVISOR
 
     velocity_raw = word2 & 0x7FFF
     azimuth_raw = (word2 >> 15) & 0x7FFF
