@@ -1,0 +1,18 @@
+
+# local env
+mmwave_venv/
+__pycache__/
+*.pyc
+
+# datasets and model weights
+MITO_Dataset/
+pretrained_weights.zip
+src/classification/checkpoints/
+
+# radar runtime data
+runtime/
+*.bin
+*.jsonl
+
+# logs
+*.log
