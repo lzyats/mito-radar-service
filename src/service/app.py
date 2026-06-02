@@ -312,7 +312,7 @@ DASHBOARD_HTML = """
         <div class="panel-body">
           <div class="controls">
             <label>采集秒数<input id="seconds" type="number" min="1" max="300" value="3"></label>
-            <label>最小距离 m<input id="minRange" type="number" min="0" step="0.1" value="0.2"></label>
+            <label>最小距离 m<input id="minRange" type="number" min="0" step="0.01" value="0.0"></label>
             <label>最大距离 m<input id="maxRange" type="number" min="0.1" step="0.1" value="3.0"></label>
             <label>样本标签<input id="label" value="empty" placeholder="empty / udisk / box"></label>
           </div>
@@ -377,7 +377,8 @@ DASHBOARD_HTML = """
         ? `${summary.non_empty_frames}/${summary.frames}`
         : "-";
       el("frames").textContent = frames;
-      el("nearest").textContent = summary.nearest_point ? `${summary.nearest_point.range_m} m` : "-";
+      const nearest = summary.nearest_point || summary.raw_nearest_point;
+      el("nearest").textContent = nearest ? `${nearest.range_m} m` : "-";
     }
 
     async function api(path, options = {}) {
@@ -399,7 +400,7 @@ DASHBOARD_HTML = """
     function params(includeLabel = false) {
       const query = new URLSearchParams({
         seconds: el("seconds").value || "3",
-        min_range: el("minRange").value || "0.2",
+        min_range: el("minRange").value || "0.0",
         max_range: el("maxRange").value || "3.0",
       });
       if (includeLabel) query.set("label", el("label").value || "empty");
@@ -531,6 +532,21 @@ def extract_filtered_points(frames, min_range: float, max_range: float | None) -
     return points
 
 
+def compact_point(point: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "frame_id": point["frame_id"],
+        "point_index": point["point_index"],
+        "range_m": round(point["range_m"], 4),
+        "velocity_mps": round(point["velocity_mps"], 4),
+        "azimuth_deg": round(point["azimuth_deg"], 4),
+        "elevation_deg": round(point["elevation_deg"], 4),
+        "snr": point["snr"],
+        "x_m": round(point["x_m"], 4),
+        "y_m": round(point["y_m"], 4),
+        "z_m": round(point["z_m"], 4),
+    }
+
+
 def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     non_empty_frames = sum(1 for frame in frames if frame.points)
     summary: dict[str, Any] = {
@@ -584,18 +600,7 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
                 "z_m": round(sum(zs) / len(zs), 4),
                 "range_m": round(sum(ranges) / len(ranges), 4),
             },
-            "nearest_point": {
-                "frame_id": nearest_point["frame_id"],
-                "point_index": nearest_point["point_index"],
-                "range_m": round(nearest_point["range_m"], 4),
-                "velocity_mps": round(nearest_point["velocity_mps"], 4),
-                "azimuth_deg": round(nearest_point["azimuth_deg"], 4),
-                "elevation_deg": round(nearest_point["elevation_deg"], 4),
-                "snr": nearest_point["snr"],
-                "x_m": round(nearest_point["x_m"], 4),
-                "y_m": round(nearest_point["y_m"], 4),
-                "z_m": round(nearest_point["z_m"], 4),
-            },
+            "nearest_point": compact_point(nearest_point),
         }
     )
     return summary
@@ -609,8 +614,13 @@ def build_capture_payload(
     max_range: float | None,
     sample_points_limit: int = 12,
 ) -> dict[str, Any]:
+    raw_points = extract_filtered_points(frames, min_range=0.0, max_range=None)
     points = extract_filtered_points(frames, min_range=min_range, max_range=max_range)
     summary = summarize_points(points, frames)
+    raw_nearest_point = min(raw_points, key=lambda point: point["range_m"]) if raw_points else None
+    summary["raw_point_count"] = len(raw_points)
+    summary["filtered_out_by_range"] = max(len(raw_points) - len(points), 0)
+    summary["raw_nearest_point"] = compact_point(raw_nearest_point) if raw_nearest_point else None
     return {
         "captured_at": utc_now(),
         "raw_bytes": len(raw),
