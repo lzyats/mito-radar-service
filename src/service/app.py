@@ -237,6 +237,38 @@ DASHBOARD_HTML = """
       font-size: 22px;
     }
 
+    .prediction-card {
+      display: grid;
+      gap: 10px;
+      margin-top: 16px;
+      padding: 16px;
+      border: 1px solid rgba(32,119,90,0.24);
+      border-radius: 12px;
+      background:
+        linear-gradient(135deg, rgba(32,119,90,0.10), rgba(255,255,255,0.72)),
+        #fbfcf8;
+    }
+
+    .prediction-card strong {
+      font-size: 30px;
+      line-height: 1;
+    }
+
+    .prediction-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .chip {
+      padding: 5px 9px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: #fff;
+    }
+
     .split {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -315,13 +347,14 @@ DASHBOARD_HTML = """
         </div>
         <div class="panel-body">
           <div class="controls">
-            <label>采集秒数<input id="seconds" type="number" min="1" max="300" value="3"></label>
+            <label>采集秒数<input id="seconds" type="number" min="1" max="300" value="8"></label>
             <label>最小距离 m<input id="minRange" type="number" min="0" step="0.01" value="0.0"></label>
             <label>最大距离 m<input id="maxRange" type="number" min="0.1" step="0.1" value="3.0"></label>
             <label>样本标签<input id="label" value="empty" placeholder="empty / udisk / box"></label>
           </div>
           <div class="actions">
             <button id="captureBtn">临时采集</button>
+            <button id="predictBtn">识别当前物品</button>
             <button id="recordBtn">保存为训练样本</button>
             <button class="secondary" id="latestBtn">查看最近一次</button>
             <button class="secondary" id="refreshData">刷新标签和记录</button>
@@ -332,6 +365,16 @@ DASHBOARD_HTML = """
             <div class="metric"><span>是否有目标</span><strong id="hasTarget">-</strong></div>
             <div class="metric"><span>非空帧</span><strong id="frames">-</strong></div>
             <div class="metric"><span>主峰距离</span><strong id="nearest">-</strong></div>
+          </div>
+
+          <div class="prediction-card">
+            <span class="subtitle">识别结果</span>
+            <strong id="predictedLabel">等待识别</strong>
+            <div class="prediction-meta">
+              <span class="chip">置信度 <b id="confidence">-</b></span>
+              <span class="chip">方法 <b id="predictMethod">-</b></span>
+              <span class="chip">距离 <b id="predictDistances">-</b></span>
+            </div>
           </div>
 
           <div class="split">
@@ -361,7 +404,7 @@ DASHBOARD_HTML = """
 
   <script>
     const el = (id) => document.getElementById(id);
-    const buttons = ["captureBtn", "recordBtn", "latestBtn", "refreshData", "refreshHealth"].map(el);
+    const buttons = ["captureBtn", "predictBtn", "recordBtn", "latestBtn", "refreshData", "refreshHealth"].map(el);
 
     function setBusy(isBusy, text = "") {
       buttons.forEach((button) => button.disabled = isBusy);
@@ -371,6 +414,7 @@ DASHBOARD_HTML = """
     function show(data) {
       el("output").textContent = JSON.stringify(data, null, 2);
       updateMetrics(data.summary || data);
+      updatePrediction(data);
     }
 
     function updateMetrics(summary) {
@@ -383,6 +427,17 @@ DASHBOARD_HTML = """
       el("frames").textContent = frames;
       const displayRange = summary.dominant_range_m ?? summary.median_range_m ?? summary.nearest_point?.range_m ?? summary.raw_nearest_point?.range_m;
       el("nearest").textContent = displayRange !== undefined && displayRange !== null ? `${displayRange} m` : "-";
+    }
+
+    function updatePrediction(data) {
+      if (!data || !data.predicted_label) return;
+      el("predictedLabel").textContent = data.predicted_label;
+      el("confidence").textContent = data.confidence !== undefined ? `${Math.round(data.confidence * 1000) / 10}%` : "-";
+      el("predictMethod").textContent = data.method || "-";
+      const distances = (data.distances || [])
+        .map((item) => `${item.label}: ${item.distance}`)
+        .join(" / ");
+      el("predictDistances").textContent = distances || "-";
     }
 
     async function api(path, options = {}) {
@@ -403,7 +458,7 @@ DASHBOARD_HTML = """
 
     function params(includeLabel = false) {
       const query = new URLSearchParams({
-        seconds: el("seconds").value || "3",
+        seconds: el("seconds").value || "8",
         min_range: el("minRange").value || "0.0",
         max_range: el("maxRange").value || "3.0",
       });
@@ -441,9 +496,9 @@ DASHBOARD_HTML = """
         return data;
       }
       const rows = records.map((item) =>
-        `<tr><td>${item.saved_as || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.summary?.dominant_range_m ?? item.summary?.nearest_point?.range_m ?? "-"}</td></tr>`
+        `<tr><td>${item.saved_as || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.predicted_label ? `预测: ${item.predicted_label}` : (item.summary?.dominant_range_m ?? item.summary?.nearest_point?.range_m ?? "-")}</td></tr>`
       ).join("");
-      el("recordsBox").innerHTML = `<table><thead><tr><th>类型</th><th>时间</th><th>主峰距离</th></tr></thead><tbody>${rows}</tbody></table>`;
+      el("recordsBox").innerHTML = `<table><thead><tr><th>类型</th><th>时间</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>`;
       return data;
     }
 
@@ -461,6 +516,10 @@ DASHBOARD_HTML = """
     el("refreshData").addEventListener("click", refreshData);
     el("latestBtn").addEventListener("click", () => api("/radar/latest"));
     el("captureBtn").addEventListener("click", () => api(`/radar/capture?${params(false)}`, { method: "POST" }));
+    el("predictBtn").addEventListener("click", async () => {
+      const data = await api(`/radar/predict?${params(false)}`, { method: "POST" });
+      if (!data.detail && !data.error) await refreshData();
+    });
     el("recordBtn").addEventListener("click", async () => {
       const data = await api(`/radar/record?${params(true)}`, { method: "POST" });
       if (!data.detail && !data.error) await refreshData();
