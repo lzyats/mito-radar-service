@@ -46,7 +46,9 @@ STOP_CMD = b"scan stop\r\n"
 
 POINT_RECORD_SIZE = 20
 SIGNED15_BIAS = 0x4000
-RANGE_DIVISOR = float(os.environ.get("RADAR_RANGE_DIVISOR", "400"))
+# The vendor UART protocol and SDK both encode distance as real meters * 100.
+# Keep this overrideable for diagnostics, but default to the documented scale.
+RANGE_DIVISOR = float(os.environ.get("RADAR_RANGE_DIVISOR", "100"))
 
 
 @dataclass
@@ -54,6 +56,7 @@ class RadarPoint:
     frame_id: int
     point_index: int
     snr: int
+    range_raw: int
     range_m: float
     velocity_mps: float
     azimuth_deg: float
@@ -117,6 +120,7 @@ def parse_point(record: bytes, frame_id: int) -> RadarPoint:
         frame_id=frame_id,
         point_index=point_index,
         snr=snr,
+        range_raw=range_raw,
         range_m=range_m,
         velocity_mps=velocity_mps,
         azimuth_deg=azimuth_deg,

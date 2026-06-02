@@ -539,6 +539,7 @@ def compact_point(point: dict[str, Any]) -> dict[str, Any]:
     return {
         "frame_id": point["frame_id"],
         "point_index": point["point_index"],
+        "range_raw": point.get("range_raw"),
         "range_m": round(point["range_m"], 4),
         "velocity_mps": round(point["velocity_mps"], 4),
         "azimuth_deg": round(point["azimuth_deg"], 4),
