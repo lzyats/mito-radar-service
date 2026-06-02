@@ -11,6 +11,7 @@ import threading
 import uuid
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 
 ROOT = Path(__file__).resolve().parents[2]
 PYTHON = ROOT / "mmwave_venv" / "bin" / "python"
@@ -36,6 +37,435 @@ sys.path.append(str(ROOT / "src" / "simulation" / "cpp"))
 sys.path.append(str(ROOT / "src" / "data_processing" / "cpp"))
 
 app = FastAPI(title="MITO Radar Service", version="1.2.0")
+
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MITO Radar Console</title>
+  <style>
+    :root {
+      --bg: #f5f7f2;
+      --panel: #ffffff;
+      --ink: #17211b;
+      --muted: #66736a;
+      --line: #dfe6dc;
+      --accent: #20775a;
+      --accent-strong: #135b44;
+      --warn: #b45f06;
+      --bad: #a73030;
+      --good: #1f7a4d;
+      --shadow: 0 18px 45px rgba(32, 56, 42, 0.12);
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background:
+        linear-gradient(135deg, rgba(32,119,90,0.10), transparent 34%),
+        linear-gradient(180deg, #fbfcf8 0%, var(--bg) 100%);
+      font-family: "Segoe UI", "Microsoft YaHei", sans-serif;
+    }
+
+    .shell {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 28px 0 42px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-end;
+      padding: 8px 0 24px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(28px, 4vw, 48px);
+      line-height: 1;
+      letter-spacing: 0;
+    }
+
+    .subtitle {
+      margin: 10px 0 0;
+      color: var(--muted);
+      font-size: 15px;
+    }
+
+    .status-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 8px 13px;
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      background: rgba(255,255,255,0.72);
+      font-size: 14px;
+      white-space: nowrap;
+    }
+
+    .dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--warn);
+    }
+
+    .dot.good { background: var(--good); }
+    .dot.bad { background: var(--bad); }
+
+    .grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.9fr;
+      gap: 18px;
+      align-items: start;
+    }
+
+    .panel {
+      background: rgba(255,255,255,0.88);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      overflow: hidden;
+    }
+
+    .panel-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: center;
+      padding: 16px 18px;
+      border-bottom: 1px solid var(--line);
+    }
+
+    .panel-title {
+      margin: 0;
+      font-size: 17px;
+      font-weight: 700;
+    }
+
+    .panel-body { padding: 18px; }
+
+    .controls {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    label {
+      display: grid;
+      gap: 6px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    input {
+      width: 100%;
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 8px 10px;
+      color: var(--ink);
+      background: #fff;
+      font: inherit;
+    }
+
+    .actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 14px;
+    }
+
+    button {
+      min-height: 40px;
+      border: 1px solid var(--accent);
+      border-radius: 6px;
+      padding: 8px 13px;
+      color: #fff;
+      background: var(--accent);
+      font: inherit;
+      font-weight: 650;
+      cursor: pointer;
+    }
+
+    button.secondary {
+      color: var(--accent-strong);
+      background: #fff;
+    }
+
+    button:disabled {
+      cursor: wait;
+      opacity: 0.55;
+    }
+
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 16px;
+    }
+
+    .metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px;
+      background: #fbfcf8;
+    }
+
+    .metric span {
+      display: block;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .metric strong {
+      display: block;
+      margin-top: 6px;
+      font-size: 22px;
+    }
+
+    .split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+      margin-top: 18px;
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 10px 8px;
+      border-bottom: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    pre {
+      min-height: 180px;
+      max-height: 420px;
+      margin: 0;
+      padding: 14px;
+      overflow: auto;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #111a15;
+      color: #d7f6e7;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .empty {
+      color: var(--muted);
+      padding: 14px 0;
+      font-size: 14px;
+    }
+
+    @media (max-width: 860px) {
+      header, .grid, .split { grid-template-columns: 1fr; display: grid; }
+      header { align-items: start; }
+      .controls, .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
+      .shell { width: min(100% - 22px, 1180px); padding-top: 18px; }
+      .controls, .metrics { grid-template-columns: 1fr; }
+      .panel-head { align-items: flex-start; flex-direction: column; }
+      button { width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header>
+      <div>
+        <h1>MITO Radar Console</h1>
+        <p class="subtitle">77G 雷达点云采集、样本保存和标签统计</p>
+      </div>
+      <div class="status-pill"><span id="healthDot" class="dot"></span><span id="healthText">等待检查</span></div>
+    </header>
+
+    <section class="grid">
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">采集控制</h2>
+          <button class="secondary" id="refreshHealth">刷新状态</button>
+        </div>
+        <div class="panel-body">
+          <div class="controls">
+            <label>采集秒数<input id="seconds" type="number" min="1" max="300" value="3"></label>
+            <label>最小距离 m<input id="minRange" type="number" min="0" step="0.1" value="0.2"></label>
+            <label>最大距离 m<input id="maxRange" type="number" min="0.1" step="0.1" value="3.0"></label>
+            <label>样本标签<input id="label" value="empty" placeholder="empty / udisk / box"></label>
+          </div>
+          <div class="actions">
+            <button id="captureBtn">临时采集</button>
+            <button id="recordBtn">保存为训练样本</button>
+            <button class="secondary" id="latestBtn">查看最近一次</button>
+            <button class="secondary" id="refreshData">刷新标签和记录</button>
+          </div>
+
+          <div class="metrics">
+            <div class="metric"><span>有效点数</span><strong id="validPoints">-</strong></div>
+            <div class="metric"><span>是否有目标</span><strong id="hasTarget">-</strong></div>
+            <div class="metric"><span>非空帧</span><strong id="frames">-</strong></div>
+            <div class="metric"><span>最近距离</span><strong id="nearest">-</strong></div>
+          </div>
+
+          <div class="split">
+            <div>
+              <h3 class="panel-title">标签统计</h3>
+              <div id="labelsBox" class="empty">暂无标签</div>
+            </div>
+            <div>
+              <h3 class="panel-title">最近记录</h3>
+              <div id="recordsBox" class="empty">暂无记录</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-head">
+          <h2 class="panel-title">接口输出</h2>
+          <span id="busyText" class="subtitle"></span>
+        </div>
+        <div class="panel-body">
+          <pre id="output">等待操作...</pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    const el = (id) => document.getElementById(id);
+    const buttons = ["captureBtn", "recordBtn", "latestBtn", "refreshData", "refreshHealth"].map(el);
+
+    function setBusy(isBusy, text = "") {
+      buttons.forEach((button) => button.disabled = isBusy);
+      el("busyText").textContent = text;
+    }
+
+    function show(data) {
+      el("output").textContent = JSON.stringify(data, null, 2);
+      updateMetrics(data.summary || data);
+    }
+
+    function updateMetrics(summary) {
+      if (!summary) return;
+      el("validPoints").textContent = summary.valid_point_count ?? "-";
+      el("hasTarget").textContent = summary.has_target === true ? "是" : summary.has_target === false ? "否" : "-";
+      const frames = summary.non_empty_frames !== undefined && summary.frames !== undefined
+        ? `${summary.non_empty_frames}/${summary.frames}`
+        : "-";
+      el("frames").textContent = frames;
+      el("nearest").textContent = summary.nearest_point ? `${summary.nearest_point.range_m} m` : "-";
+    }
+
+    async function api(path, options = {}) {
+      setBusy(true, "请求中...");
+      try {
+        const res = await fetch(path, options);
+        const data = await res.json();
+        show(data);
+        return data;
+      } catch (error) {
+        const data = { error: String(error) };
+        show(data);
+        return data;
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    function params(includeLabel = false) {
+      const query = new URLSearchParams({
+        seconds: el("seconds").value || "3",
+        min_range: el("minRange").value || "0.2",
+        max_range: el("maxRange").value || "3.0",
+      });
+      if (includeLabel) query.set("label", el("label").value || "empty");
+      return query.toString();
+    }
+
+    async function refreshHealth() {
+      const data = await api("/radar/health");
+      const dot = el("healthDot");
+      dot.className = data.ok ? "dot good" : "dot bad";
+      el("healthText").textContent = data.ok
+        ? `雷达已连接 ${data.port}`
+        : `雷达未就绪 ${data.port || ""}`;
+    }
+
+    async function refreshLabels() {
+      const data = await fetch("/radar/labels").then((r) => r.json());
+      if (!data.labels || !data.labels.length) {
+        el("labelsBox").innerHTML = '<div class="empty">暂无标签</div>';
+        return data;
+      }
+      const rows = data.labels.map((item) =>
+        `<tr><td>${item.label}</td><td>${item.sample_count ?? item.count}</td></tr>`
+      ).join("");
+      el("labelsBox").innerHTML = `<table><thead><tr><th>标签</th><th>样本数</th></tr></thead><tbody>${rows}</tbody></table>`;
+      return data;
+    }
+
+    async function refreshRecords() {
+      const data = await fetch("/radar/records?limit=8").then((r) => r.json());
+      if (!data.records || !data.records.length) {
+        el("recordsBox").innerHTML = '<div class="empty">暂无记录</div>';
+        return data;
+      }
+      const rows = data.records.map((item) =>
+        `<tr><td>${item.label || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.summary?.valid_point_count ?? "-"}</td></tr>`
+      ).join("");
+      el("recordsBox").innerHTML = `<table><thead><tr><th>标签</th><th>时间</th><th>点数</th></tr></thead><tbody>${rows}</tbody></table>`;
+      return data;
+    }
+
+    async function refreshData() {
+      setBusy(true, "刷新中...");
+      try {
+        const [labels, records] = await Promise.all([refreshLabels(), refreshRecords()]);
+        show({ labels, records });
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    el("refreshHealth").addEventListener("click", refreshHealth);
+    el("refreshData").addEventListener("click", refreshData);
+    el("latestBtn").addEventListener("click", () => api("/radar/latest"));
+    el("captureBtn").addEventListener("click", () => api(`/radar/capture?${params(false)}`, { method: "POST" }));
+    el("recordBtn").addEventListener("click", async () => {
+      const data = await api(`/radar/record?${params(true)}`, { method: "POST" });
+      if (!data.detail && !data.error) await refreshData();
+    });
+
+    refreshHealth();
+    refreshData();
+  </script>
+</body>
+</html>
+"""
 
 
 def utc_now() -> str:
@@ -266,23 +696,9 @@ def list_record_items() -> list[dict[str, Any]]:
     return items
 
 
-@app.get("/")
+@app.get("/", response_class=HTMLResponse)
 def root():
-    return {
-        "service": "mito-radar-service",
-        "version": app.version,
-        "routes": [
-            "/health",
-            "/classifier/test",
-            "/jobs/{job_id}",
-            "/radar/health",
-            "/radar/capture",
-            "/radar/latest",
-            "/radar/record",
-            "/radar/records",
-            "/radar/labels",
-        ],
-    }
+    return HTMLResponse(DASHBOARD_HTML)
 
 
 @app.get("/health")
