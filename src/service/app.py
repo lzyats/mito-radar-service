@@ -2,6 +2,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import hashlib
 import json
 import math
 import os
@@ -28,7 +29,22 @@ WEIGHTS_PATH = ROOT / "src" / "classification" / "checkpoints" / "1103c_final_al
 DEFAULT_RADAR_PORT = os.environ.get("RADAR_PORT", "/dev/ttyACM0")
 DEFAULT_RADAR_BAUD = int(os.environ.get("RADAR_BAUD", "3000000"))
 ALLOWED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+SANITIZE_LABEL_RE = re.compile(r"[^A-Za-z0-9_-]+")
 MIN_PREDICT_SAMPLES_PER_LABEL = 3
+DISPLAY_LABEL_PRESETS = {
+    "空场景": "empty",
+    "空白": "empty",
+    "无人": "empty",
+    "无物": "empty",
+    "u盘": "udisk",
+    "U盘": "udisk",
+    "优盘": "udisk",
+    "盒子": "box",
+    "纸盒": "box",
+    "箱子": "box",
+    "小物体": "small_object",
+    "小物件": "small_object",
+}
 
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 RADAR_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -350,7 +366,8 @@ DASHBOARD_HTML = """
             <label>采集秒数<input id="seconds" type="number" min="1" max="300" value="8"></label>
             <label>最小距离 m<input id="minRange" type="number" min="0" step="0.01" value="0.0"></label>
             <label>最大距离 m<input id="maxRange" type="number" min="0.1" step="0.1" value="3.0"></label>
-            <label>样本标签<input id="label" value="empty" placeholder="empty / udisk / box"></label>
+            <label>中文显示名<input id="displayLabel" value="空场景" placeholder="空场景 / U盘 / 盒子"></label>
+            <label>机器标签<input id="label" value="" placeholder="留空自动生成，如 empty / udisk"></label>
           </div>
           <div class="actions">
             <button id="captureBtn">临时采集</button>
@@ -431,11 +448,12 @@ DASHBOARD_HTML = """
 
     function updatePrediction(data) {
       if (!data || !data.predicted_label) return;
-      el("predictedLabel").textContent = data.predicted_label;
+      const display = data.predicted_display_label || data.predicted_label;
+      el("predictedLabel").textContent = display === data.predicted_label ? display : `${display} / ${data.predicted_label}`;
       el("confidence").textContent = data.confidence !== undefined ? `${Math.round(data.confidence * 1000) / 10}%` : "-";
       el("predictMethod").textContent = data.method || "-";
       const distances = (data.distances || [])
-        .map((item) => `${item.label}: ${item.distance}`)
+        .map((item) => `${item.display_label || item.label}: ${item.distance}`)
         .join(" / ");
       el("predictDistances").textContent = distances || "-";
     }
@@ -462,7 +480,12 @@ DASHBOARD_HTML = """
         min_range: el("minRange").value || "0.0",
         max_range: el("maxRange").value || "3.0",
       });
-      if (includeLabel) query.set("label", el("label").value || "empty");
+      if (includeLabel) {
+        const label = (el("label").value || "").trim();
+        const displayLabel = (el("displayLabel").value || "").trim();
+        if (label) query.set("label", label);
+        if (displayLabel) query.set("display_label", displayLabel);
+      }
       return query.toString();
     }
 
@@ -482,9 +505,9 @@ DASHBOARD_HTML = """
         return data;
       }
       const rows = data.labels.map((item) =>
-        `<tr><td>${item.label}</td><td>${item.sample_count ?? item.count}</td></tr>`
+        `<tr><td>${item.display_label || item.label}</td><td>${item.label}</td><td>${item.sample_count ?? item.count}</td></tr>`
       ).join("");
-      el("labelsBox").innerHTML = `<table><thead><tr><th>标签</th><th>样本数</th></tr></thead><tbody>${rows}</tbody></table>`;
+      el("labelsBox").innerHTML = `<table><thead><tr><th>显示名</th><th>机器标签</th><th>样本数</th></tr></thead><tbody>${rows}</tbody></table>`;
       return data;
     }
 
@@ -496,7 +519,7 @@ DASHBOARD_HTML = """
         return data;
       }
       const rows = records.map((item) =>
-        `<tr><td>${item.saved_as || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.predicted_label ? `预测: ${item.predicted_label}` : (item.summary?.dominant_range_m ?? item.summary?.nearest_point?.range_m ?? "-")}</td></tr>`
+        `<tr><td>${item.saved_as || "-"}</td><td>${item.captured_at || "-"}</td><td>${item.predicted_display_label ? `预测: ${item.predicted_display_label} / ${item.predicted_label}` : (item.summary?.dominant_range_m ?? item.summary?.nearest_point?.range_m ?? "-")}</td></tr>`
       ).join("");
       el("recordsBox").innerHTML = `<table><thead><tr><th>类型</th><th>时间</th><th>结果</th></tr></thead><tbody>${rows}</tbody></table>`;
       return data;
@@ -727,6 +750,45 @@ def ensure_valid_label(label: str) -> str:
     return label
 
 
+def normalize_display_label(display_label: str | None) -> str | None:
+    if display_label is None:
+        return None
+    normalized = re.sub(r"\s+", " ", display_label).strip()
+    return normalized or None
+
+
+def sanitize_label_candidate(text: str) -> str | None:
+    candidate = SANITIZE_LABEL_RE.sub("_", text.strip().lower())
+    candidate = re.sub(r"_+", "_", candidate).strip("_-")
+    if not candidate:
+        return None
+    if not candidate[0].isalnum():
+        candidate = f"label_{candidate}"
+    candidate = candidate[:64]
+    return candidate if ALLOWED_LABEL_RE.fullmatch(candidate) else None
+
+
+def auto_machine_label(display_label: str) -> str:
+    preset = DISPLAY_LABEL_PRESETS.get(display_label)
+    if preset:
+        return preset
+    candidate = sanitize_label_candidate(display_label)
+    if candidate:
+        return candidate
+    digest = hashlib.sha1(display_label.encode("utf-8")).hexdigest()[:8]
+    return f"label_{digest}"
+
+
+def resolve_record_labels(label: str | None, display_label: str | None) -> tuple[str, str | None]:
+    normalized_display = normalize_display_label(display_label)
+    if label is not None:
+        normalized_label = ensure_valid_label(label.strip())
+        return normalized_label, normalized_display or normalized_label
+    if normalized_display is None:
+        raise HTTPException(status_code=400, detail="label or display_label is required")
+    return auto_machine_label(normalized_display), normalized_display
+
+
 def resolve_port_exists(port: str) -> bool:
     try:
         return Path(port).exists()
@@ -809,6 +871,16 @@ def list_capture_items() -> list[dict[str, Any]]:
         meta["meta_path"] = str(meta_path)
         items.append(meta)
     return items
+
+
+def build_label_display_map() -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    for item in list_record_items():
+        label = item.get("label")
+        display_label = normalize_display_label(item.get("display_label"))
+        if isinstance(label, str) and label and display_label and label not in mapping:
+            mapping[label] = display_label
+    return mapping
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -915,6 +987,7 @@ def build_sample_profile() -> dict[str, Any]:
 
 def predict_label(summary: dict[str, Any]) -> dict[str, Any]:
     profile = build_sample_profile()
+    label_display_map = build_label_display_map()
     centroids = profile["centroids"]
     if len(centroids) < 2:
         raise HTTPException(
@@ -927,6 +1000,7 @@ def predict_label(summary: dict[str, Any]) -> dict[str, Any]:
     distances = [
         {
             "label": label,
+            "display_label": label_display_map.get(label, label),
             "distance": round(euclidean_distance(normalized, centroid), 4),
             "sample_count": profile["usable_counts"].get(label, 0),
         }
@@ -945,6 +1019,7 @@ def predict_label(summary: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "predicted_label": best["label"],
+        "predicted_display_label": label_display_map.get(best["label"], best["label"]),
         "confidence": round(confidence, 4),
         "method": "nearest_centroid_v1",
         "distances": distances,
@@ -952,6 +1027,7 @@ def predict_label(summary: dict[str, Any]) -> dict[str, Any]:
         "model_profile": {
             "sample_counts": profile["sample_counts"],
             "usable_counts": profile["usable_counts"],
+            "display_labels": label_display_map,
             "min_samples_per_label": MIN_PREDICT_SAMPLES_PER_LABEL,
         },
     }
@@ -1195,14 +1271,15 @@ def radar_captures(limit: int = Query(20, ge=1, le=200)):
 
 @app.post("/radar/record")
 def radar_record(
-    label: str = Query(..., min_length=1),
+    label: str | None = Query(None, min_length=1),
+    display_label: str | None = Query(None, min_length=1),
     seconds: int = Query(8, ge=1, le=300),
     min_range: float = Query(0.0, ge=0.0),
     max_range: float | None = Query(None),
     port: str = Query(DEFAULT_RADAR_PORT),
     baud: int = Query(DEFAULT_RADAR_BAUD, ge=1),
 ):
-    label = ensure_valid_label(label)
+    label, display_label = resolve_record_labels(label, display_label)
     raw, frames, payload = capture_radar_once(
         port=port,
         baud=baud,
@@ -1221,6 +1298,7 @@ def radar_record(
     meta = {
         **payload,
         "label": label,
+        "display_label": display_label,
         "port": port,
         "baud": baud,
         "seconds": seconds,
@@ -1257,9 +1335,17 @@ def radar_labels():
             continue
         meta_files = list(label_dir.glob("*.meta.json"))
         sample_count = len(meta_files)
+        display_label = label_dir.name
+        for meta_path in sorted(meta_files, reverse=True):
+            try:
+                display_label = normalize_display_label(read_json(meta_path).get("display_label")) or label_dir.name
+                break
+            except Exception:
+                continue
         labels.append(
             {
                 "label": label_dir.name,
+                "display_label": display_label,
                 "sample_count": sample_count,
                 "count": sample_count,
             }
@@ -1273,6 +1359,7 @@ def radar_labels():
 @app.get("/radar/model/profile")
 def radar_model_profile():
     profile = build_sample_profile()
+    display_labels = build_label_display_map()
     return {
         "method": "nearest_centroid_v1",
         "min_samples_per_label": MIN_PREDICT_SAMPLES_PER_LABEL,
@@ -1280,6 +1367,7 @@ def radar_model_profile():
         "usable_label_count": len(profile["usable_counts"]),
         "sample_counts": profile["sample_counts"],
         "usable_counts": profile["usable_counts"],
+        "display_labels": display_labels,
         "ready": len(profile["centroids"]) >= 2,
     }
 
