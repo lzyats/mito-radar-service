@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import json
+import math
 import os
 import re
 import subprocess
@@ -27,6 +28,7 @@ WEIGHTS_PATH = ROOT / "src" / "classification" / "checkpoints" / "1103c_final_al
 DEFAULT_RADAR_PORT = os.environ.get("RADAR_PORT", "/dev/ttyACM0")
 DEFAULT_RADAR_BAUD = int(os.environ.get("RADAR_BAUD", "3000000"))
 ALLOWED_LABEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$")
+MIN_PREDICT_SAMPLES_PER_LABEL = 3
 
 JOB_DIR.mkdir(parents=True, exist_ok=True)
 RADAR_RECORDS_DIR.mkdir(parents=True, exist_ok=True)
@@ -750,6 +752,152 @@ def list_capture_items() -> list[dict[str, Any]]:
     return items
 
 
+def safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return default
+    return number if math.isfinite(number) else default
+
+
+def span(values: Any) -> float:
+    if not isinstance(values, list) or len(values) != 2:
+        return 0.0
+    return safe_float(values[1]) - safe_float(values[0])
+
+
+def summary_features(summary: dict[str, Any]) -> list[float]:
+    frames = max(safe_float(summary.get("frames")), 1.0)
+    point_count = safe_float(summary.get("point_count"))
+    dominant_count = safe_float(summary.get("dominant_range_count"))
+    bbox = summary.get("bbox") if isinstance(summary.get("bbox"), dict) else {}
+    center = summary.get("center") if isinstance(summary.get("center"), dict) else {}
+
+    return [
+        safe_float(summary.get("non_empty_frame_ratio")),
+        point_count / frames,
+        safe_float(summary.get("avg_range_m")),
+        safe_float(summary.get("median_range_m")),
+        safe_float(summary.get("p90_range_m")),
+        safe_float(summary.get("dominant_range_m")),
+        dominant_count / max(point_count, 1.0),
+        safe_float(summary.get("min_range_m")),
+        safe_float(summary.get("max_range_m")),
+        safe_float(summary.get("avg_snr")) / 10000.0,
+        safe_float(summary.get("max_snr")) / 10000.0,
+        abs(safe_float(summary.get("avg_velocity_mps"))),
+        span(bbox.get("x")),
+        span(bbox.get("y")),
+        span(bbox.get("z")),
+        safe_float(center.get("x_m")),
+        safe_float(center.get("y_m")),
+        safe_float(center.get("z_m")),
+    ]
+
+
+def mean_vector(vectors: list[list[float]]) -> list[float]:
+    if not vectors:
+        return []
+    width = len(vectors[0])
+    return [sum(vector[index] for vector in vectors) / len(vectors) for index in range(width)]
+
+
+def std_vector(vectors: list[list[float]], means: list[float]) -> list[float]:
+    if not vectors:
+        return []
+    width = len(means)
+    stds: list[float] = []
+    for index in range(width):
+        variance = sum((vector[index] - means[index]) ** 2 for vector in vectors) / len(vectors)
+        stds.append(max(math.sqrt(variance), 1e-6))
+    return stds
+
+
+def normalize_vector(vector: list[float], means: list[float], stds: list[float]) -> list[float]:
+    return [(value - means[index]) / stds[index] for index, value in enumerate(vector)]
+
+
+def euclidean_distance(left: list[float], right: list[float]) -> float:
+    return math.sqrt(sum((a - b) ** 2 for a, b in zip(left, right)))
+
+
+def build_sample_profile() -> dict[str, Any]:
+    by_label: dict[str, list[list[float]]] = {}
+    for item in list_record_items():
+        label = item.get("label")
+        summary = item.get("summary")
+        if not isinstance(label, str) or not isinstance(summary, dict):
+            continue
+        by_label.setdefault(label, []).append(summary_features(summary))
+
+    usable = {
+        label: vectors
+        for label, vectors in by_label.items()
+        if len(vectors) >= MIN_PREDICT_SAMPLES_PER_LABEL
+    }
+    all_vectors = [vector for vectors in usable.values() for vector in vectors]
+    means = mean_vector(all_vectors)
+    stds = std_vector(all_vectors, means)
+    centroids = {
+        label: mean_vector([normalize_vector(vector, means, stds) for vector in vectors])
+        for label, vectors in usable.items()
+    }
+
+    return {
+        "sample_counts": {label: len(vectors) for label, vectors in by_label.items()},
+        "usable_counts": {label: len(vectors) for label, vectors in usable.items()},
+        "feature_mean": means,
+        "feature_std": stds,
+        "centroids": centroids,
+    }
+
+
+def predict_label(summary: dict[str, Any]) -> dict[str, Any]:
+    profile = build_sample_profile()
+    centroids = profile["centroids"]
+    if len(centroids) < 2:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Need at least 2 labels with {MIN_PREDICT_SAMPLES_PER_LABEL}+ samples each",
+        )
+
+    features = summary_features(summary)
+    normalized = normalize_vector(features, profile["feature_mean"], profile["feature_std"])
+    distances = [
+        {
+            "label": label,
+            "distance": round(euclidean_distance(normalized, centroid), 4),
+            "sample_count": profile["usable_counts"].get(label, 0),
+        }
+        for label, centroid in centroids.items()
+    ]
+    distances.sort(key=lambda item: item["distance"])
+
+    best = distances[0]
+    second = distances[1] if len(distances) > 1 else None
+    best_distance = max(float(best["distance"]), 1e-6)
+    if second:
+        margin = max(float(second["distance"]) - best_distance, 0.0)
+        confidence = margin / (float(second["distance"]) + best_distance)
+    else:
+        confidence = 0.0
+
+    return {
+        "predicted_label": best["label"],
+        "confidence": round(confidence, 4),
+        "method": "nearest_centroid_v1",
+        "distances": distances,
+        "features": [round(value, 6) for value in features],
+        "model_profile": {
+            "sample_counts": profile["sample_counts"],
+            "usable_counts": profile["usable_counts"],
+            "min_samples_per_label": MIN_PREDICT_SAMPLES_PER_LABEL,
+        },
+    }
+
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     return HTMLResponse(DASHBOARD_HTML)
@@ -1060,6 +1208,60 @@ def radar_labels():
     return {
         "count": len(labels),
         "labels": labels,
+    }
+
+
+@app.get("/radar/model/profile")
+def radar_model_profile():
+    profile = build_sample_profile()
+    return {
+        "method": "nearest_centroid_v1",
+        "min_samples_per_label": MIN_PREDICT_SAMPLES_PER_LABEL,
+        "label_count": len(profile["sample_counts"]),
+        "usable_label_count": len(profile["usable_counts"]),
+        "sample_counts": profile["sample_counts"],
+        "usable_counts": profile["usable_counts"],
+        "ready": len(profile["centroids"]) >= 2,
+    }
+
+
+@app.post("/radar/predict")
+def radar_predict(
+    seconds: int = Query(8, ge=1, le=300),
+    min_range: float = Query(0.0, ge=0.0),
+    max_range: float | None = Query(None),
+    port: str = Query(DEFAULT_RADAR_PORT),
+    baud: int = Query(DEFAULT_RADAR_BAUD, ge=1),
+):
+    raw, frames, payload = capture_radar_once(
+        port=port,
+        baud=baud,
+        seconds=seconds,
+        min_range=min_range,
+        max_range=max_range,
+    )
+    prediction = predict_label(payload["summary"])
+    tag = f"predict_{now_tag()}_{uuid.uuid4().hex[:8]}"
+    meta = {
+        **payload,
+        **prediction,
+        "port": port,
+        "baud": baud,
+        "seconds": seconds,
+        "saved_as": "prediction",
+        "prediction_id": tag,
+    }
+    artifact_paths = save_capture_artifacts(
+        raw=raw,
+        frames=frames,
+        meta=meta,
+        bin_path=RADAR_CAPTURE_DIR / f"{tag}.bin",
+        jsonl_path=RADAR_CAPTURE_DIR / f"{tag}.jsonl",
+        meta_path=RADAR_CAPTURE_DIR / f"{tag}.meta.json",
+    )
+    return {
+        **meta,
+        "history": artifact_paths,
     }
 
 
