@@ -106,10 +106,15 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     summary: dict[str, Any] = {
         "frames": len(frames),
         "non_empty_frames": non_empty_frames,
+        "non_empty_frame_ratio": round(non_empty_frames / len(frames), 4) if frames else 0.0,
         "point_count": len(points),
+        "valid_point_count": len(points),
+        "has_target": len(points) > 0,
     }
 
     if not frames:
+        summary["center"] = None
+        summary["nearest_point"] = None
         return summary
 
     summary["frame_ids"] = {
@@ -118,6 +123,8 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     }
 
     if not points:
+        summary["center"] = None
+        summary["nearest_point"] = None
         return summary
 
     ranges = [point["range_m"] for point in points]
@@ -126,6 +133,7 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
     xs = [point["x_m"] for point in points]
     ys = [point["y_m"] for point in points]
     zs = [point["z_m"] for point in points]
+    nearest_point = min(points, key=lambda point: point["range_m"])
 
     summary.update(
         {
@@ -139,6 +147,24 @@ def summarize_points(points: list[dict[str, Any]], frames) -> dict[str, Any]:
                 "x": [round(min(xs), 4), round(max(xs), 4)],
                 "y": [round(min(ys), 4), round(max(ys), 4)],
                 "z": [round(min(zs), 4), round(max(zs), 4)],
+            },
+            "center": {
+                "x_m": round(sum(xs) / len(xs), 4),
+                "y_m": round(sum(ys) / len(ys), 4),
+                "z_m": round(sum(zs) / len(zs), 4),
+                "range_m": round(sum(ranges) / len(ranges), 4),
+            },
+            "nearest_point": {
+                "frame_id": nearest_point["frame_id"],
+                "point_index": nearest_point["point_index"],
+                "range_m": round(nearest_point["range_m"], 4),
+                "velocity_mps": round(nearest_point["velocity_mps"], 4),
+                "azimuth_deg": round(nearest_point["azimuth_deg"], 4),
+                "elevation_deg": round(nearest_point["elevation_deg"], 4),
+                "snr": nearest_point["snr"],
+                "x_m": round(nearest_point["x_m"], 4),
+                "y_m": round(nearest_point["y_m"], 4),
+                "z_m": round(nearest_point["z_m"], 4),
             },
         }
     )
@@ -527,10 +553,12 @@ def radar_labels():
         if not label_dir.is_dir():
             continue
         meta_files = list(label_dir.glob("*.meta.json"))
+        sample_count = len(meta_files)
         labels.append(
             {
                 "label": label_dir.name,
-                "count": len(meta_files),
+                "sample_count": sample_count,
+                "count": sample_count,
             }
         )
     return {
