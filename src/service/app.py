@@ -346,6 +346,7 @@ def radar_health(
     baud: int = Query(DEFAULT_RADAR_BAUD),
 ):
     helper_error = None
+    port_exists = resolve_port_exists(port)
     start_command = "scan start -1 stream_on"
     stop_command = "scan stop"
     try:
@@ -356,10 +357,10 @@ def radar_health(
         helper_error = exc.detail
 
     return {
-        "ok": helper_error is None,
+        "ok": helper_error is None and port_exists,
         "port": port,
         "baud": baud,
-        "port_exists": resolve_port_exists(port),
+        "port_exists": port_exists,
         "reader_exists": (ROOT / "radar_hex_reader_v2.py").exists(),
         "helper_import_ok": helper_error is None,
         "helper_error": helper_error,
